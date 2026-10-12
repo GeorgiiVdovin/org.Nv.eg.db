@@ -1,0 +1,14 @@
+import(methods)
+import(AnnotationDbi)
+
+### Only put what is statically exported here. The OrgDb object org.Nv.eg.db
+### is created and exported at load time (see R/zzz.R).
+export(
+    org.Nv.eg,
+    org.Nv.eg_dbconn,
+    org.Nv.eg_dbfile,
+    org.Nv.eg_dbschema,
+    org.Nv.eg_dbInfo,
+
+    org.Nv.egORGANISM
+)

@@ -1,0 +1,24 @@
+Package: org.Nv.eg.db
+Title: Genome Wide Annotation for Notophthalmus viridescens
+Description: Gene-level annotation of the eastern newt (Notophthalmus viridescens)
+    de novo transcriptome of Tsissios et al. (2024; GEO GSE236907), which is used as
+    published, not reassembled. A gene is a cluster of transcripts
+    that overlap at >= 98 % identity, with non-overlapping fragments of one gene joined
+    through their alignments to the same Swiss-Prot protein, and the myogenic regulatory
+    factors Myf5, Myog and Myf6 added from the transcriptome of Abdullayev et al. (2013).
+    The cluster IDs (GID) map to SYMBOL, GENENAME, UNIPROT, GO and GOALL, and TXID (the
+    transcripts) through the AnnotationDbi select() interface, so it works with clusterProfiler like
+    any other OrgDb.
+Version: 1.0.0
+Authors@R: person("Georgii", "Vdovin", email = "gvdovin@age.mpg.de",
+    role = c("aut", "cre"))
+Depends: R (>= 4.0.0), methods, AnnotationDbi (>= 1.72.0)
+Imports: tools
+Suggests: DBI, GO.db
+License: MIT + file LICENSE
+URL: https://github.com/GeorgiiVdovin/org.Nv.eg.db
+BugReports: https://github.com/GeorgiiVdovin/org.Nv.eg.db/issues
+organism: Notophthalmus viridescens
+species: Notophthalmus viridescens
+biocViews: AnnotationData, OrgDb, Notophthalmus_viridescens
+Encoding: UTF-8

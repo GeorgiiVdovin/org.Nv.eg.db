@@ -1,0 +1,98 @@
+---
+title: "Annotation Package"
+output: html_notebook
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup}
+project_root <- rprojroot::find_rstudio_root_file()
+knitr::opts_knit$set(root.dir = file.path(project_root, "newt_a1_browser"))
+setwd(file.path(project_root, "newt_a1_browser"))
+
+pacman::p_load(AnnotationForge, data.table, tidyverse) # tidyverse last, so that select() is the dplyr one
+```
+
+
+#Package Tables
+```{r}
+# Genes, their annotation and GO terms (5_gene_clusters.Rmd, 6_cluster_annotation.Rmd). All genes go in, so that every transcript finds its gene
+genes <- fread("reference/clusters/annotation_nvir_clusters.csv.gz")
+
+gene_info <- genes %>%
+  select(GID = GENEID, SYMBOL, GENENAME)
+
+uniprot <- genes %>%
+  filter(!is.na(UNIPROT)) %>%
+  select(GID = GENEID, UNIPROT) %>%
+  separate_rows(UNIPROT, sep = "; ")
+
+go <- fread("reference/clusters/go_nvir_clusters.csv.gz") %>%
+  select(GID = GENEID, GO, EVIDENCE)
+
+tx <- fread("reference/clusters/tx2gene_nvir_clusters.csv.gz") %>%
+  select(GID = GENEID, TXID = TXNAME)
+```
+
+
+#Package
+```{r}
+# AnnotationForge writes a package with the database into a temporary folder. GO IDs unknown to GO.db are dropped
+build_dir <- file.path(tempdir(), "org_build")
+dir.create(build_dir)
+
+makeOrgPackage(gene_info = gene_info,
+               uniprot = uniprot,
+               go = go,
+               tx = tx,
+               version = "1.0.0",
+               maintainer = "Georgii Vdovin <gvdovin@age.mpg.de>",
+               author = "Georgii Vdovin",
+               outputDir = build_dir,
+               tax_id = "8316",
+               genus = "Notophthalmus",
+               species = "viridescens",
+               goTable = "go")
+```
+
+
+```{r}
+# Only the database is taken, the package files in org.Nv.eg.db/ are written by hand. VACUUM removes the empty space AnnotationForge leaves,
+# xz compresses it for GitHub, and the package unpacks it on the first load (R/zzz.R). Sizes in MB
+db <- file.path(build_dir, "org.Nviridescens.eg.db/inst/extdata/org.Nviridescens.eg.sqlite")
+
+con <- DBI::dbConnect(RSQLite::SQLite(), db)
+DBI::dbExecute(con, "VACUUM")
+DBI::dbDisconnect(con)
+
+xz <- xzfile("org.Nv.eg.db/inst/extdata/org.Nv.eg.sqlite.xz", "wb", compression = 9)
+writeBin(readBin(db, "raw", file.size(db)), xz)
+close(xz)
+
+file.size(db) / 1e6
+file.size("org.Nv.eg.db/inst/extdata/org.Nv.eg.sqlite.xz") / 1e6
+```
+
+
+```{r}
+# The tx2gene for tximport and the scripts that made the package are included (the Myf5, Myog and Myf6 contigs are written by package_inputs.R)
+file.copy("reference/clusters/tx2gene_nvir_clusters.csv.gz", "org.Nv.eg.db/inst/extdata", overwrite = TRUE)
+
+scripts <- c("build/package_inputs.R",
+             "build/input/blast/blast_all_vs_all.sh", "build/input/blast/blastx_hit_proteins.sh",
+             "build/input/uniprot/fetch_uniprot_go.py", "build/input/uniprot/fetch_uniprot_fasta.py",
+             "build/5_gene_clusters.Rmd", "build/6_cluster_annotation.Rmd", "build/7_org_package.Rmd")
+
+file.copy(scripts, "org.Nv.eg.db/inst/scripts", overwrite = TRUE)
+```
+
+
+```{r eval = FALSE}
+# Install from the folder, then library(org.Nv.eg.db)
+install.packages("org.Nv.eg.db", type = "source", repos = NULL)
+```
+
+
+```{r}
+sessionInfo()
+```

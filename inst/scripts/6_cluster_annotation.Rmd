@@ -1,0 +1,133 @@
+---
+title: "Gene Annotation"
+output: html_notebook
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup}
+project_root <- rprojroot::find_rstudio_root_file()
+knitr::opts_knit$set(root.dir = file.path(project_root, "newt_a1_browser"))
+setwd(file.path(project_root, "newt_a1_browser"))
+
+pacman::p_load(data.table, tidyverse)
+```
+
+
+#Swiss-Prot Hits
+```{r}
+# Genes from 5_gene_clusters.Rmd
+tx2gene <- fread("reference/clusters/tx2gene_nvir_clusters.csv.gz")
+
+# Best Swiss-Prot hit of each transcript (package_inputs.R). Hits without an entry-name symbol are empty
+swissprot <- fread("build/input/swissprot/swissprot_hits.csv.gz", na.strings = c("", "NA"))
+
+# The Sandberg contigs of Myf5, Myog and Myf6 with their Swiss-Prot hit (Abdullayev et al. 2013). Their columns are shifted: aling_length holds the E-value, evalue the bit score
+mrf <- fread("build/input/sandberg_mrf/sandberg_mrf_annotation.csv") %>%
+  transmute(txid = target_id,
+            protein = str_remove(sacc, "RecName: Full="),
+            accession = UNIPROT_swissp,
+            evalue = aling_length,
+            pident = pident,
+            bitscore = evalue,
+            SYMBOL_mrf = SYMBOL_merged)
+
+tx <- tx2gene %>%
+  select(txid = TXNAME, GENEID) %>%
+  left_join(bind_rows(swissprot, mrf), by = "txid")
+
+# Gene names and GO terms of the hit proteins from UniProt (fetch_uniprot_go.py). The 13 lines with a single field are obsolete accessions
+uniprot <- fread("build/input/uniprot/uniprot_go.tsv", fill = TRUE, na.strings = "") %>%
+  filter(!is.na(reviewed))
+```
+
+
+#Symbols
+```{r}
+# Best hit of each gene: the member hit with the lowest E-value (ties: highest bit score)
+best <- tx %>%
+  filter(!is.na(accession)) %>%
+  arrange(evalue, desc(bitscore), txid) %>%
+  distinct(GENEID, .keep_all = TRUE) %>%
+  left_join(uniprot, by = "accession")
+
+# Symbol: the UniProt gene name of the best hit (the first if several), else the symbol of its entry name (e.g. ACTS), in sentence case with "-" for "_".
+# Myf5, Myog and Myf6 by their annotation, genes without a gene name keep their ID
+best <- best %>%
+  mutate(symbol = coalesce(na_if(str_remove(gene_primary, ";.*"), ""), entry_symbol) %>%
+           str_to_sentence() %>%
+           str_replace_all("_", "-"),
+         symbol = coalesce(SYMBOL_mrf, symbol, GENEID))
+
+# Genes that share a symbol: the best E-value keeps it, the others get .2, .3 ... in E-value order
+best <- best %>%
+  group_by(symbol) %>%
+  mutate(SYMBOL = if_else(row_number() == 1, symbol, paste0(symbol, ".", row_number()))) %>%
+  ungroup()
+```
+
+
+#GO Terms
+```{r}
+# GO terms of the hit proteins of all members, transferred by sequence similarity (ISS). No electronic (IEA) annotation is used
+uniprot_go <- uniprot %>%
+  filter(!is.na(go_ids)) %>%
+  select(accession, GO = go_ids) %>%
+  separate_rows(GO, sep = "; ")
+
+go <- tx %>%
+  filter(!is.na(accession)) %>%
+  distinct(GENEID, accession) %>%
+  inner_join(uniprot_go, by = "accession", relationship = "many-to-many") %>%
+  distinct(GENEID, GO) %>%
+  mutate(EVIDENCE = "ISS") %>%
+  arrange(GENEID, GO)
+
+fwrite(go, "reference/clusters/go_nvir_clusters.csv.gz")
+```
+
+
+#Gene Table
+```{r}
+# All hit proteins of each gene
+uniprot_ids <- tx %>%
+  filter(!is.na(accession)) %>%
+  distinct(GENEID, accession) %>%
+  group_by(GENEID) %>%
+  summarise(UNIPROT = paste(accession, collapse = "; "))
+
+# One row per gene. Gene name: the protein name of the best hit without alternative names (after ";") and species (the bracket at the end), else "-"
+genes <- tx %>%
+  distinct(GENEID) %>%
+  left_join(best %>% select(GENEID, SYMBOL, protein, best_hit = accession, evalue), by = "GENEID") %>%
+  left_join(uniprot_ids, by = "GENEID") %>%
+  left_join(go %>% count(GENEID, name = "GO_n"), by = "GENEID") %>%
+  mutate(SYMBOL = coalesce(SYMBOL, GENEID),
+         GENENAME = coalesce(str_remove(protein, ";.*") %>% str_remove(" \\[(\\[[^\\]]*\\])?[^\\[\\]]*\\]$"), "-"),
+         GO_n = replace_na(GO_n, 0L)) %>%
+  select(GENEID, SYMBOL, GENENAME, UNIPROT, best_hit, evalue, GO_n)
+
+fwrite(genes, "reference/clusters/annotation_nvir_clusters.csv.gz", na = "NA")
+
+# One row per transcript: its gene and Swiss-Prot hit
+tx %>%
+  select(txid, GENEID, accession, evalue, pident) %>%
+  fwrite("reference/clusters/annotation_nvir_clusters_tx.csv.gz", na = "NA")
+```
+
+
+```{r}
+# Genes with a Swiss-Prot hit, a symbol and GO terms, and the number of GO terms
+genes %>%
+  summarise(genes = n(),
+            swissprot_hit = sum(!is.na(best_hit)),
+            symbol = sum(SYMBOL != GENEID),
+            GO = sum(GO_n > 0))
+
+n_distinct(go$GO)
+```
+
+
+```{r}
+sessionInfo()
+```

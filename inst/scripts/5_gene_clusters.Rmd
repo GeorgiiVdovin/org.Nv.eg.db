@@ -1,0 +1,192 @@
+---
+title: "Gene Clusters"
+output: html_notebook
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup}
+project_root <- rprojroot::find_rstudio_root_file()
+knitr::opts_knit$set(root.dir = file.path(project_root, "newt_a1_browser"))
+setwd(file.path(project_root, "newt_a1_browser"))
+
+pacman::p_load(data.table, tidyverse, igraph)
+```
+
+
+#Overlap Clusters
+```{r}
+# All-vs-all megablast of the transcriptome (blast_all_vs_all.sh): hits at >= 95 % identity over >= 100 bp, and at 90-95 % over >= 300 bp
+blast_columns <- c("qseqid", "sseqid", "pident", "length", "qlen", "slen", "qstart", "qend", "sstart", "send", "bitscore")
+
+hits <- fread("build/input/blast/all_hits_95.tsv.gz", col.names = blast_columns)
+hits_90 <- fread("build/input/blast/all_hits_90_95_300bp.tsv.gz", col.names = blast_columns)
+
+# Two transcripts belong to one gene when they align at >= 98 % identity over >= 300 bp and >= 25 % of the shorter one.
+# 98 % is where the identity of overlapping transcripts has its minimum, between alleles of one gene and paralogs
+edges <- hits %>%
+  filter(pident >= 98, length >= 300, length / pmin(qlen, slen) >= 0.25) %>%
+  transmute(from = pmin(qseqid, sseqid), to = pmax(qseqid, sseqid)) %>%
+  distinct()
+```
+
+
+```{r}
+# All transcripts: the transcriptome and the five Sandberg contigs at the end (package_inputs.R)
+lengths <- Biostrings::fasta.seqlengths("reference/Nvir_transcriptome_tsissios_mrf.fa.gz")
+
+tx <- data.frame(TXNAME = sub(" .*", "", names(lengths)), # The Sandberg names carry a description
+                 length = unname(lengths))
+
+mrf <- read.csv("build/input/sandberg_mrf/sandberg_mrf_annotation.csv")
+is_mrf <- tx$TXNAME %in% mrf$target_id
+
+# Transcripts connected by edges form a cluster, a transcript without partners is a cluster of its own
+graph <- graph_from_data_frame(edges, directed = FALSE, vertices = data.frame(name = tx$TXNAME[!is_mrf]))
+
+tx$cluster <- NA
+tx$cluster[!is_mrf] <- as.character(components(graph)$membership[tx$TXNAME[!is_mrf]])
+
+# The Sandberg contigs are three clusters: Myf5, Myog and Myf6
+tx$cluster[is_mrf] <- mrf$SYMBOL_merged[match(tx$TXNAME[is_mrf], mrf$target_id)]
+
+n_distinct(tx$cluster)
+```
+
+
+#Conflict Split
+```{r}
+# A cluster can join two transcripts that are only 90-97 % identical when a third one matches both at >= 98 %.
+# Distance of two members: 100 - identity when they align over >= 300 bp (best bit score per pair)
+cluster_of <- setNames(tx$cluster, tx$TXNAME)
+
+aligned <- bind_rows(hits, hits_90) %>%
+  filter(length >= 300) %>%
+  transmute(a = pmin(qseqid, sseqid), b = pmax(qseqid, sseqid), pident, bitscore) %>%
+  arrange(desc(bitscore)) %>%
+  distinct(a, b, .keep_all = TRUE) %>%
+  filter(cluster_of[a] == cluster_of[b]) %>%
+  transmute(a, b, cluster = cluster_of[a], distance = 100 - pident)
+```
+
+
+```{r}
+# Best Swiss-Prot hit of each transcript (package_inputs.R), and blastx of these transcripts against their hit proteins (blastx_hit_proteins.sh)
+swissprot <- fread("build/input/swissprot/swissprot_hits.csv.gz")
+
+blastx <- fread("build/input/blast/blastx_hits.tsv.gz",
+                col.names = c("qseqid", "sseqid", "pident", "length", "qstart", "qend", "sstart", "send", "slen", "evalue", "bitscore"))
+
+# Distance 10 for members that align to the same region of one protein (>= 100 residues) but have no nucleotide hit to each other: different genes
+coding <- blastx %>%
+  transmute(TXNAME = qseqid, cluster = cluster_of[qseqid], protein = sseqid, start = sstart, end = send)
+
+same_region <- inner_join(coding, coding, by = c("cluster", "protein"), suffix = c("_a", "_b"), relationship = "many-to-many") %>%
+  filter(TXNAME_a < TXNAME_b, pmin(end_a, end_b) - pmax(start_a, start_b) + 1 >= 100) %>%
+  distinct(a = TXNAME_a, b = TXNAME_b, cluster)
+
+nucleotide_pairs <- bind_rows(hits, hits_90) %>%
+  transmute(a = pmin(qseqid, sseqid), b = pmax(qseqid, sseqid))
+
+distances <- bind_rows(aligned,
+                       anti_join(same_region, nucleotide_pairs, by = c("a", "b")) %>% mutate(distance = 10))
+```
+
+
+```{r}
+# Clusters with a pair at distance > 3 are split by complete linkage, cut at 3: aligned members of one part are >= 97 % identical.
+# Pairs without an alignment get distance 3, so fragments can stay together but never outrank a real alignment
+conflicts <- unique(distances$cluster[distances$distance > 3])
+
+for (id in conflicts) {
+  members <- tx$TXNAME[tx$cluster == id]
+  d <- distances[distances$cluster == id, ]
+
+  m <- matrix(3, length(members), length(members), dimnames = list(members, members))
+  diag(m) <- 0
+  m[cbind(d$a, d$b)] <- d$distance
+  m[cbind(d$b, d$a)] <- d$distance
+
+  parts <- cutree(hclust(as.dist(m), method = "complete"), h = 3)
+  tx$cluster[tx$cluster == id] <- paste(id, parts, sep = "_")
+}
+
+length(conflicts)
+n_distinct(tx$cluster)
+```
+
+
+#Fragment Merge
+```{r}
+# Best hit of each cluster: the member hit with the lowest E-value (ties: highest bit score)
+best <- swissprot %>%
+  inner_join(tx, by = c("txid" = "TXNAME")) %>%
+  arrange(evalue, desc(bitscore), txid) %>%
+  distinct(cluster, .keep_all = TRUE)
+
+# Only proteins hit by <= 20 transcripts (not repeat families) that are the best hit of several clusters
+ordinary <- swissprot %>% count(accession) %>% filter(n <= 20) %>% pull(accession)
+
+best <- best %>%
+  filter(accession %in% ordinary) %>%
+  group_by(accession) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+# Span of each cluster on its best-hit protein: lowest start to highest end of its members' alignments to that protein
+spans <- tx %>%
+  inner_join(best %>% select(cluster, protein = accession, evalue, bitscore, best_tx = txid), by = "cluster") %>%
+  inner_join(blastx %>% select(qseqid, sseqid, sstart, send), by = c("TXNAME" = "qseqid", "protein" = "sseqid")) %>%
+  group_by(cluster, protein, evalue, bitscore, best_tx) %>%
+  summarise(start = min(sstart), end = max(send), .groups = "drop") %>%
+  arrange(protein, evalue, desc(bitscore), best_tx)
+```
+
+
+```{r}
+# Clusters of one protein in E-value order: each joins the first earlier group whose spans it overlaps by < 20 % of the shorter span (fragments of one gene).
+# Clusters that cover the same part of the protein stay apart (alleles or paralogs below 98 %)
+group <- spans$cluster
+
+for (i in which(duplicated(spans$protein))) {
+  earlier <- which(spans$protein[1:(i - 1)] == spans$protein[i])
+  overlap <- pmin(spans$end[earlier], spans$end[i]) - pmax(spans$start[earlier], spans$start[i]) + 1
+  shorter <- pmin(spans$end[earlier] - spans$start[earlier], spans$end[i] - spans$start[i]) + 1
+  taken <- group[earlier][overlap >= 0.2 * shorter] # Groups that already cover this part
+  group[i] <- c(setdiff(group[earlier], taken), group[i])[1]
+}
+
+joined <- setNames(group, spans$cluster)
+tx$cluster <- ifelse(tx$cluster %in% names(joined), joined[tx$cluster], tx$cluster)
+
+sum(group != spans$cluster)
+n_distinct(tx$cluster)
+```
+
+
+#Gene IDs
+```{r}
+# NVG000001 onwards in transcript order (chunk, then number), so the IDs depend only on the transcriptome. The Sandberg contigs come last
+tx <- tx %>%
+  mutate(chunk = as.integer(str_extract(TXNAME, "^[0-9]+(?=_)")),
+         number = as.integer(str_extract(TXNAME, "(?<=_)[0-9]+$"))) %>%
+  arrange(chunk, number) %>%
+  mutate(GENEID = sprintf("NVG%06d", match(cluster, unique(cluster))))
+
+dir.create("reference/clusters", showWarnings = FALSE)
+
+# tx2gene for tximport: every transcript exactly once
+fwrite(tx %>% select(TXNAME, GENEID), "reference/clusters/tx2gene_nvir_clusters.csv.gz")
+
+# One row per gene: number of transcripts and the longest one
+tx %>%
+  arrange(GENEID, desc(length)) %>%
+  group_by(GENEID) %>%
+  summarise(n_transcripts = n(), longest_transcript = TXNAME[1], length = length[1]) %>%
+  fwrite("reference/clusters/clusters_nvir.csv.gz")
+```
+
+
+```{r}
+sessionInfo()
+```
